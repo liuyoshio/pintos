@@ -32,11 +32,23 @@ static void real_time_delay (int64_t num, int32_t denom);
 
 /** Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
+
+struct list sleep_queue;
+
+struct sleep_thread {
+  struct list_elem elem;
+  int64_t wake_time;
+  struct semaphore semaphore;
+};
+
 void
 timer_init (void) 
 {
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+
+  // initialize the sleep queue
+  list_init(&sleep_queue);
 }
 
 /** Calibrates loops_per_tick, used to implement brief delays. */
@@ -84,16 +96,40 @@ timer_elapsed (int64_t then)
   return timer_ticks () - then;
 }
 
+static bool 
+sleep_thread_less(const struct list_elem *a_, const struct list_elem *b_, 
+void *aux UNUSED) 
+{
+  const struct sleep_thread *a = list_entry(a_, struct sleep_thread, elem);
+  const struct sleep_thread *b = list_entry(b_, struct sleep_thread, elem);
+
+  return a->wake_time < b->wake_time;
+}
+
 /** Sleeps for approximately TICKS timer ticks.  Interrupts must
    be turned on. */
 void
 timer_sleep (int64_t ticks) 
 {
-  int64_t start = timer_ticks ();
+  // int64_t start = timer_ticks ();
 
-  ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+  // ASSERT (intr_get_level () == INTR_ON);
+  // while (timer_elapsed (start) < ticks) 
+  //   thread_yield ();
+
+  enum intr_level old_level = intr_disable ();
+
+  // create a sleep thread
+  struct sleep_thread st;
+  st.wake_time = timer_ticks() + ticks;
+  sema_init(&st.semaphore, 0);
+
+  // insert the sleep thread into the sleep queue
+  list_insert_ordered(&sleep_queue, &st.elem, *sleep_thread_less, NULL);
+
+  // block the thread
+  sema_down(&st.semaphore);
+  intr_set_level(old_level);
 }
 
 /** Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -171,6 +207,18 @@ static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
+
+  // wake up sleeping threads
+  while (!list_empty(&sleep_queue)) {
+    struct sleep_thread *st = list_entry(list_front(&sleep_queue), struct sleep_thread, elem);
+    if (st->wake_time <= ticks) {
+      list_pop_front(&sleep_queue);
+      sema_up(&st->semaphore);
+    } else {
+      break;
+    }
+  }
+
   thread_tick ();
 }
 
